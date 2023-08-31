@@ -18,10 +18,16 @@
 
 package org.apache.flink.training.exercises.longrides;
 
+import jdk.jfr.ValueDescriptor;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
@@ -97,18 +103,73 @@ public class LongRidesExercise {
 
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
+        private transient MapState<String , Long> startEndTime;
+        private static final String START_TIME = "START_TIME";
+        private static final String END_TIME = "END_TIME";
 
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            /*
+            getRuntimeContext().getState(new ValueStateDescriptor<>("startTimeState", Float.class));
+            getRuntimeContext().getState(new ValueStateDescriptor<>("endTimeState", Float.class));
+            */
+            startEndTime = getRuntimeContext().getMapState(
+                    new MapStateDescriptor<>("startEndTime", String.class, Long.class));
         }
 
         @Override
         public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+                throws Exception {
+            TimerService timerService = context.timerService();
+            long eventTime = ride.getEventTimeMillis();
+            if(eventTime <= timerService.currentWatermark()) {
+                // late event, dropping
+            } else {
+                long twoHoursInMillis = 2 * 60 * 60 * 1000;
+                long endOfWindow = eventTime + twoHoursInMillis;
+                if(ride.isStart) {
+                    startEndTime.put(START_TIME, ride.getEventTimeMillis());
+                    if(startEndTime.contains(END_TIME)) {
+                        long timerWindow = startEndTime.get(END_TIME) + twoHoursInMillis;
+                        long duration = Math.abs(startEndTime.get(START_TIME) - startEndTime.get(END_TIME));
+                        if(duration > 2 * 60 * 60 * 1000) {
+                            out.collect(ride.rideId);
+                        }
+                        timerService.deleteEventTimeTimer(timerWindow);
+                        startEndTime.clear();
+                    } else {
+                        timerService.registerEventTimeTimer(endOfWindow);
+                    }
+                } else {
+                    startEndTime.put(END_TIME, ride.getEventTimeMillis());
+                    if(startEndTime.contains(START_TIME)) {
+                        long timerWindow = startEndTime.get(START_TIME) + twoHoursInMillis;
+
+                        long duration = Math.abs(startEndTime.get(START_TIME) - startEndTime.get(END_TIME));
+                        if(duration > 2 * 60 * 60 * 1000) {
+                            out.collect(ride.rideId);
+                        }
+                        timerService.deleteEventTimeTimer(timerWindow);
+                        startEndTime.clear();
+                    } else {
+                        timerService.registerEventTimeTimer(endOfWindow);
+                    }
+                }
+            }
+        }
 
         @Override
         public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
+                throws Exception {
+            Long rideId = context.getCurrentKey();
+            if(startEndTime.contains(START_TIME) && startEndTime.contains(END_TIME)) {
+                long duration = Math.abs(startEndTime.get(START_TIME) - startEndTime.get(END_TIME));
+                if(duration > 2 * 60 * 60 * 1000) {
+                    out.collect(rideId);
+                }
+            } else {
+                out.collect(rideId);
+            }
+        }
     }
 }
